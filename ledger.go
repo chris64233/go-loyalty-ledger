@@ -6,6 +6,8 @@
 //     （FEFO）跨批次分摊；任一可用量不足则整笔消费失败、账本不变。
 //   - 所有写操作在单账本互斥锁内串行提交，配合统一的 Clock 时间源，
 //     保证过期推进与消费、撤销并发发生时，每个批次的数量只沿合法方向变化。
+//   - 入账与过期扫描均可携带业务流水号：重复提交返回首次结果，
+//     内容不一致返回 ErrDuplicateID；过期只核销批次中仍未使用的部分。
 //   - 消费支持外部消费号幂等：重复提交相同内容返回首次的分摊结果。
 //   - 撤销严格按原消费记录逐批恢复；撤销时对应批次已过期的部分只留痕、
 //     不重新变成可消费积分；累计撤销不得超过原消费。
@@ -34,6 +36,10 @@ type Ledger struct {
 	consumeByExternal map[string]string
 	// revokeByExternal 撤销自身的幂等键 -> 分录 ID。
 	revokeByExternal map[string]string
+	// grantByExternal 入账业务流水号 -> 发放分录 ID。
+	grantByExternal map[string]string
+	// expireByScanID 过期扫描业务流水号 -> 过期分录 ID。
+	expireByScanID map[string]string
 }
 
 // consumeSplitState 是某批次在一条消费记录上的分摊状态。
@@ -68,6 +74,8 @@ func New(memberID string, clock Clock) (*Ledger, error) {
 		consumes:          make(map[string]*consumeRecord),
 		consumeByExternal: make(map[string]string),
 		revokeByExternal:  make(map[string]string),
+		grantByExternal:   make(map[string]string),
+		expireByScanID:    make(map[string]string),
 	}, nil
 }
 
@@ -83,6 +91,23 @@ func (l *Ledger) nextID(kind string) string {
 // Grant 发放 amount 积分，形成一个失效时间为 expireAt 的不可修改批次。
 // 失效时间必须晚于统一时钟的当前时刻。
 func (l *Ledger) Grant(amount int64, expireAt time.Time, remark string) (GrantReceipt, error) {
+	return l.grant("", "", amount, expireAt, remark)
+}
+
+// GrantWithID 带业务流水号的入账：同一 externalID 重复提交相同内容
+// （金额、来源、失效时间、备注一致）时直接返回首次入账结果，不重复入账；
+// 内容不一致时返回 ErrDuplicateID。source 记录积分来源并随批次保存。
+//
+// 账本是单会员维度，“用户”维度天然固定：同一流水号落到不同会员账本
+// 不会产生交叉；本方法内的冲突检测覆盖金额、来源与失效时间。
+func (l *Ledger) GrantWithID(externalID, source string, amount int64, expireAt time.Time, remark string) (GrantReceipt, error) {
+	if externalID == "" {
+		return GrantReceipt{}, invalidArgumentf("external grant id must not be empty")
+	}
+	return l.grant(externalID, source, amount, expireAt, remark)
+}
+
+func (l *Ledger) grant(externalID, source string, amount int64, expireAt time.Time, remark string) (GrantReceipt, error) {
 	if amount <= 0 {
 		return GrantReceipt{}, invalidArgumentf("grant amount must be positive, got %d", amount)
 	}
@@ -92,6 +117,27 @@ func (l *Ledger) Grant(amount int64, expireAt time.Time, remark string) (GrantRe
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// 幂等：同号相同内容返回首次结果（即使批次此后已过期）；
+	// 同号不同内容视为调用方错误。该判断必须先于失效时间校验，
+	// 否则时钟推进后重放会被误判为 ErrAlreadyExpired。
+	if externalID != "" {
+		if eid, ok := l.grantByExternal[externalID]; ok {
+			e := l.entryByID[eid]
+			d := e.Grant
+			b := l.batchByID[d.BatchID]
+			if d.Amount != amount || d.Source != source || !b.ExpireAt.Equal(expireAt) || e.Remark != remark {
+				return GrantReceipt{}, grantConflict(externalID, e, b.ExpireAt, amount, source, expireAt)
+			}
+			return GrantReceipt{
+				EntryID:    e.ID,
+				BatchID:    d.BatchID,
+				Amount:     d.Amount,
+				ExternalID: externalID,
+				Source:     d.Source,
+			}, nil
+		}
+	}
 
 	now := l.clock()
 	if !now.Before(expireAt) {
@@ -103,6 +149,7 @@ func (l *Ledger) Grant(amount int64, expireAt time.Time, remark string) (GrantRe
 	b := &Batch{
 		ID:        batchID,
 		MemberID:  l.memberID,
+		Source:    source,
 		Granted:   amount,
 		Remaining: amount,
 		ExpireAt:  expireAt,
@@ -111,6 +158,9 @@ func (l *Ledger) Grant(amount int64, expireAt time.Time, remark string) (GrantRe
 	l.batches = append(l.batches, b)
 	l.batchByID[batchID] = b
 
+	if externalID != "" {
+		l.grantByExternal[externalID] = entryID
+	}
 	l.appendEntry(&Entry{
 		ID:         entryID,
 		MemberID:   l.memberID,
@@ -118,10 +168,10 @@ func (l *Ledger) Grant(amount int64, expireAt time.Time, remark string) (GrantRe
 		Amount:     amount,
 		OccurredAt: now,
 		Remark:     remark,
-		Grant:      &GrantDetail{BatchID: batchID, Amount: amount},
+		Grant:      &GrantDetail{ExternalID: externalID, BatchID: batchID, Amount: amount, Source: source},
 	})
 
-	return GrantReceipt{EntryID: entryID, BatchID: batchID, Amount: amount}, nil
+	return GrantReceipt{EntryID: entryID, BatchID: batchID, Amount: amount, ExternalID: externalID, Source: source}, nil
 }
 
 // Consume 消费 amount 积分，按最早失效优先在批次间分摊，整笔原子成功或失败。
@@ -335,10 +385,41 @@ func (l *Ledger) Revoke(consumeID string, amount int64, revokeExternalID, remark
 func (l *Ledger) Expire() (ExpireReceipt, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.expireLocked(l.clock())
+	return l.expireLocked(l.clock(), "")
 }
 
-func (l *Ledger) expireLocked(now time.Time) (ExpireReceipt, error) {
+// ExpireWithID 带业务流水号的过期扫描：同一 scanID 重复扫描直接返回
+// 首次扫描的分录结果，不会把后续新到期的批次并入，也不会重复核销。
+// 首次扫描没有任何批次到期时不记录该流水号（返回零值收据），
+// 之后用同一 scanID 的扫描按首次有效扫描处理。
+func (l *Ledger) ExpireWithID(scanID string) (ExpireReceipt, error) {
+	if scanID == "" {
+		return ExpireReceipt{}, invalidArgumentf("expire scan id must not be empty")
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if eid, ok := l.expireByScanID[scanID]; ok {
+		e := l.entryByID[eid]
+		return ExpireReceipt{
+			EntryID: e.ID,
+			ScanID:  scanID,
+			Batches: cloneExpiredBatches(e.Expire.Batches),
+		}, nil
+	}
+
+	r, err := l.expireLocked(l.clock(), scanID)
+	if err != nil {
+		return ExpireReceipt{}, err
+	}
+	if r.EntryID != "" {
+		l.expireByScanID[scanID] = r.EntryID
+	}
+	return r, nil
+}
+
+func (l *Ledger) expireLocked(now time.Time, scanID string) (ExpireReceipt, error) {
 	var batches []ExpiredBatch
 	var total int64
 	for _, b := range l.batches {
@@ -366,15 +447,15 @@ func (l *Ledger) expireLocked(now time.Time) (ExpireReceipt, error) {
 		Type:       EntryExpire,
 		Amount:     total,
 		OccurredAt: now,
-		Expire:     &ExpireDetail{Batches: batches},
+		Expire:     &ExpireDetail{ScanID: scanID, Batches: batches},
 	})
-	return ExpireReceipt{EntryID: entryID, Batches: cloneExpiredBatches(batches)}, nil
+	return ExpireReceipt{EntryID: entryID, ScanID: scanID, Batches: cloneExpiredBatches(batches)}, nil
 }
 
 // sweepExpiredLocked 在消费、撤销提交前先推进到期批次。
 // 它与显式 Expire 走同一条过期核销路径，保证时间边界口径统一。
 func (l *Ledger) sweepExpiredLocked(now time.Time) error {
-	_, err := l.expireLocked(now)
+	_, err := l.expireLocked(now, "")
 	return err
 }
 
@@ -397,6 +478,31 @@ func (l *Ledger) availableAtLocked(now time.Time) int64 {
 	var total int64
 	for _, b := range l.batches {
 		total += b.AvailableAt(now)
+	}
+	return total
+}
+
+// RecomputedBalance 由账本全部分录重算当前余额：
+// 发放入账 − 消费出账 + 撤销中真正恢复可用的部分 − 过期核销。
+// 它恒等于各批次 Remaining 之和，可用于对账校验“余额来自账本而非覆盖值”。
+//
+// 注意与 Available 的区别：Available 按当前时刻把“已到期但尚未推进”的
+// 批次也视为不可用；RecomputedBalance 只反映已提交分录。推进过期后两者相等。
+func (l *Ledger) RecomputedBalance() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var total int64
+	for _, e := range l.entries {
+		switch e.Type {
+		case EntryGrant:
+			total += e.Amount
+		case EntryConsume:
+			total -= e.Amount
+		case EntryRevoke:
+			total += e.Revoke.Restored
+		case EntryExpire:
+			total -= e.Amount
+		}
 	}
 	return total
 }
@@ -531,15 +637,32 @@ func idempotencyConflict(externalID string, first, again int64) error {
 	return &duplicateIDError{externalID: externalID, first: first, again: again}
 }
 
+// grantConflict 构造入账流水号冲突错误，列出首次与本次的关键内容。
+func grantConflict(externalID string, first *Entry, firstExpireAt time.Time, amount int64, source string, expireAt time.Time) error {
+	d := first.Grant
+	return &duplicateIDError{
+		externalID: externalID,
+		first:      d.Amount,
+		again:      amount,
+		detail: "first source " + d.Source + " expireAt " + firstExpireAt.Format(time.RFC3339) +
+			", repeat source " + source + " expireAt " + expireAt.Format(time.RFC3339),
+	}
+}
+
 type duplicateIDError struct {
 	externalID string
 	first      int64
 	again      int64
+	detail     string
 }
 
 func (e *duplicateIDError) Error() string {
-	return "goloyaltyledger: idempotency key reused with different request: " +
+	msg := "goloyaltyledger: idempotency key reused with different request: " +
 		e.externalID + " first amount " + itoa(e.first) + ", repeat amount " + itoa(e.again)
+	if e.detail != "" {
+		msg += " (" + e.detail + ")"
+	}
+	return msg
 }
 
 func (e *duplicateIDError) Is(target error) bool { return target == ErrDuplicateID }

@@ -559,3 +559,323 @@ func TestConcurrentConsumeExpireRevokeConsistent(t *testing.T) {
 		t.Fatalf("negative balance: %d", got)
 	}
 }
+
+func TestGrantWithIDRecordsSourceAndValidWindow(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	expireAt := t0.Add(48 * time.Hour)
+	r, err := l.GrantWithID("grant-1", "开卡礼", 100, expireAt, "")
+	if err != nil {
+		t.Fatalf("GrantWithID: %v", err)
+	}
+	b := l.Batch(r.BatchID)
+	if b.Source != "开卡礼" {
+		t.Fatalf("batch source = %q, want 开卡礼", b.Source)
+	}
+	// 可用时间段：发放时刻至失效时刻。
+	if !b.CreatedAt.Equal(t0) || !b.ExpireAt.Equal(expireAt) {
+		t.Fatalf("valid window = %v..%v", b.CreatedAt, b.ExpireAt)
+	}
+	if b.AvailableAt(t0.Add(47*time.Hour)) != 100 || b.AvailableAt(expireAt) != 0 {
+		t.Fatal("availability window boundary wrong")
+	}
+}
+
+func TestGrantWithIDIdempotentReplay(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	first, err := l.GrantWithID("grant-1", "开卡礼", 100, t0.Add(24*time.Hour), "")
+	if err != nil {
+		t.Fatalf("GrantWithID: %v", err)
+	}
+	// 时钟推进到原批次已过期之后：重放仍须返回首次结果，而不是报已过期。
+	c.Advance(48 * time.Hour)
+	again, err := l.GrantWithID("grant-1", "开卡礼", 100, t0.Add(24*time.Hour), "")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if again.EntryID != first.EntryID || again.BatchID != first.BatchID {
+		t.Fatalf("replay = %+v, want first %+v", again, first)
+	}
+	// 不重复入账：分录与余额都只算一次。
+	if got := l.RecomputedBalance(); got != 100 {
+		t.Fatalf("recomputed balance = %d, want 100", got)
+	}
+	grants := 0
+	for _, e := range l.Entries() {
+		if e.Type == EntryGrant {
+			grants++
+		}
+	}
+	if grants != 1 {
+		t.Fatalf("grant entries = %d, want 1", grants)
+	}
+}
+
+func TestGrantWithIDConflict(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	if _, err := l.GrantWithID("grant-1", "开卡礼", 100, t0.Add(24*time.Hour), ""); err != nil {
+		t.Fatalf("GrantWithID: %v", err)
+	}
+	// 金额变化 -> 冲突。
+	if _, err := l.GrantWithID("grant-1", "开卡礼", 200, t0.Add(24*time.Hour), ""); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("amount change err = %v, want ErrDuplicateID", err)
+	}
+	// 来源变化 -> 冲突。
+	if _, err := l.GrantWithID("grant-1", "消费返积分", 100, t0.Add(24*time.Hour), ""); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("source change err = %v, want ErrDuplicateID", err)
+	}
+	// 失效时间变化 -> 冲突。
+	if _, err := l.GrantWithID("grant-1", "开卡礼", 100, t0.Add(48*time.Hour), ""); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("expireAt change err = %v, want ErrDuplicateID", err)
+	}
+	// 冲突不产生任何入账。
+	if got := l.RecomputedBalance(); got != 100 {
+		t.Fatalf("recomputed balance = %d, want 100", got)
+	}
+	// 空流水号非法。
+	if _, err := l.GrantWithID("", "s", 1, t0.Add(time.Hour), ""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty id err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestExpireWithIDRepeatedScanReturnsOriginal(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	b1 := mustGrant(t, l, 50, t0.Add(time.Hour))
+	b2 := mustGrant(t, l, 70, t0.Add(48*time.Hour))
+
+	c.Advance(2 * time.Hour) // 只有 b1 到期
+	first, err := l.ExpireWithID("scan-1")
+	if err != nil {
+		t.Fatalf("ExpireWithID: %v", err)
+	}
+	if len(first.Batches) != 1 || first.Batches[0].BatchID != b1.BatchID || first.Batches[0].Amount != 50 {
+		t.Fatalf("first scan = %+v", first)
+	}
+
+	c.Advance(72 * time.Hour) // b2 也到期了
+	// 重复扫描同一流水号：返回首次结果，不会把 b2 并入、也不会重复核销 b1。
+	again, err := l.ExpireWithID("scan-1")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if again.EntryID != first.EntryID || len(again.Batches) != 1 || again.Batches[0].Amount != 50 {
+		t.Fatalf("replay = %+v, want original %+v", again, first)
+	}
+	if b := l.Batch(b2.BatchID); b.Remaining != 70 || b.Expired != 0 {
+		t.Fatalf("b2 must not be swept by replayed scan: %+v", b)
+	}
+	if b := l.Batch(b1.BatchID); b.Expired != 50 {
+		t.Fatalf("b1 double swept: %+v", b)
+	}
+	// 新的扫描流水号才推进 b2。
+	second, err := l.ExpireWithID("scan-2")
+	if err != nil {
+		t.Fatalf("ExpireWithID scan-2: %v", err)
+	}
+	if len(second.Batches) != 1 || second.Batches[0].BatchID != b2.BatchID || second.Batches[0].Amount != 70 {
+		t.Fatalf("second scan = %+v", second)
+	}
+	if got := l.RecomputedBalance(); got != 0 {
+		t.Fatalf("recomputed balance = %d, want 0", got)
+	}
+	// 空扫描号非法。
+	if _, err := l.ExpireWithID(""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty scan id err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestPartialConsumeThenExpireSplitsBatch(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	g := mustGrant(t, l, 100, t0.Add(time.Hour))
+	cons := mustConsume(t, l, "c1", 30) // 用掉 30，剩 70
+
+	c.Advance(2 * time.Hour)
+	r, err := l.Expire()
+	if err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+	// 只核销仍未使用的 70，不能把整笔批次清零。
+	if len(r.Batches) != 1 || r.Batches[0].Amount != 70 {
+		t.Fatalf("expire receipt = %+v, want only unused 70", r)
+	}
+	b := l.Batch(g.BatchID)
+	if b.Granted != 100 || b.Remaining != 0 || b.Consumed != 30 || b.Expired != 70 {
+		t.Fatalf("batch split = %+v, want granted100/consumed30/expired70", b)
+	}
+	// 已消费部分仍可按原记录撤销路径处理（此处批次已过期，只留痕）。
+	rv, err := l.Revoke(cons.ConsumeID, 0, "", "")
+	if err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if rv.Restored != 0 || rv.ExpiredAmount != 30 {
+		t.Fatalf("revoke = %+v, want all 30 traced as expired", rv)
+	}
+	b = l.Batch(g.BatchID)
+	if b.Consumed != 0 || b.Expired != 100 {
+		t.Fatalf("batch after revoke = %+v, want expired 100 total", b)
+	}
+}
+
+func TestRecomputedBalanceMatchesEntriesAndBatches(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	mustGrant(t, l, 100, t0.Add(time.Hour))
+	if _, err := l.GrantWithID("g2", "消费返积分", 50, t0.Add(72*time.Hour), ""); err != nil {
+		t.Fatalf("GrantWithID: %v", err)
+	}
+	cons := mustConsume(t, l, "c1", 80)
+	if _, err := l.Revoke(cons.ConsumeID, 20, "", ""); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	c.Advance(2 * time.Hour)
+	if _, err := l.Expire(); err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+
+	// 余额必须能由账本重算：重算值 == 各批次 Remaining 之和 == Available。
+	var sumRemaining int64
+	for _, b := range l.Batches() {
+		sumRemaining += b.Remaining
+	}
+	if got := l.RecomputedBalance(); got != sumRemaining {
+		t.Fatalf("recomputed = %d, sum of batch remaining = %d", got, sumRemaining)
+	}
+	if got, want := l.RecomputedBalance(), l.Available(); got != want {
+		t.Fatalf("recomputed = %d, available = %d (post-sweep must match)", got, want)
+	}
+
+	// 手工按分录流水独立重算，交叉验证。
+	var fold int64
+	for _, e := range l.Entries() {
+		switch e.Type {
+		case EntryGrant:
+			fold += e.Amount
+		case EntryConsume:
+			fold -= e.Amount
+		case EntryRevoke:
+			fold += e.Revoke.Restored
+		case EntryExpire:
+			fold -= e.Amount
+		}
+	}
+	if fold != l.RecomputedBalance() {
+		t.Fatalf("manual fold = %d, recomputed = %d", fold, l.RecomputedBalance())
+	}
+}
+
+func TestConsumeExactlyAtExpiryBoundary(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	mustGrant(t, l, 40, t0.Add(time.Hour))
+
+	// 失效时刻前一纳秒：仍可消费。
+	c.Set(t0.Add(time.Hour).Add(-time.Nanosecond))
+	mustConsume(t, l, "c1", 10)
+	// 到达失效时刻：消费提交前会沿同一路径推进过期，
+	// 剩余 30 被核销（只核销未使用部分），消费因余额不足失败。
+	c.Set(t0.Add(time.Hour))
+	if _, err := l.Consume("c2", 1, ""); !errors.Is(err, ErrInsufficientPoints) {
+		t.Fatalf("err = %v, want ErrInsufficientPoints", err)
+	}
+	var b *Batch
+	for _, x := range l.Batches() {
+		b = x
+	}
+	if b.Remaining != 0 || b.Consumed != 10 || b.Expired != 30 {
+		t.Fatalf("batch = %+v, want consumed 10 / expired 30 (only the unused part)", b)
+	}
+	// 已推进过的批次不会被重复扫描核销。
+	r, err := l.Expire()
+	if err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+	if r.EntryID != "" || len(r.Batches) != 0 {
+		t.Fatalf("re-scan must be a no-op: %+v", r)
+	}
+}
+
+func TestConcurrentDuplicateConsumeAndScan(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+	mustGrant(t, l, 500, t0.Add(time.Hour))
+
+	const workers = 16
+	var wg sync.WaitGroup
+	// 同一消费号、同一内容并发提交：只许扣一次，且都拿到同一消费记录；
+	// 若扫描先把时钟推进过失效时刻，消费可能因余额不足失败，同样合法。
+	ids := make([]string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			r, err := l.Consume("order-dup", 50, "")
+			if err != nil {
+				if !errors.Is(err, ErrInsufficientPoints) {
+					t.Errorf("duplicate consume: %v", err)
+				}
+				return
+			}
+			ids[w] = r.ConsumeID
+		}(w)
+	}
+	// 同一扫描号并发提交：只产生一条过期分录。
+	scanEntries := make([]string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			c.Advance(2 * time.Hour)
+			r, err := l.ExpireWithID("scan-dup")
+			if err != nil {
+				t.Errorf("duplicate scan: %v", err)
+				return
+			}
+			scanEntries[w] = r.EntryID
+		}(w)
+	}
+	wg.Wait()
+
+	var firstID string
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if firstID == "" {
+			firstID = id
+		} else if id != firstID {
+			t.Fatalf("duplicate consume created multiple records: %v", ids)
+		}
+	}
+	var firstScan string
+	for _, id := range scanEntries {
+		if id == "" {
+			continue // 扫描与消费竞速，先到者可能扫到零批次
+		}
+		if firstScan == "" {
+			firstScan = id
+		} else if id != firstScan {
+			t.Fatalf("duplicate scan created multiple entries: %v", scanEntries)
+		}
+	}
+	// 无论消费与扫描如何交错，最终 500 积分要么被消费要么被过期核销，
+	// 余额必须能由账本重算为 0，且批次不变量成立。
+	if got := l.RecomputedBalance(); got != 0 {
+		t.Fatalf("recomputed balance = %d, want 0", got)
+	}
+	for _, b := range l.Batches() {
+		if b.Granted != b.Remaining+b.Consumed+b.Expired {
+			t.Fatalf("invariant violated in batch %+v", b)
+		}
+	}
+}

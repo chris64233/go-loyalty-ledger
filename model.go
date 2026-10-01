@@ -28,6 +28,8 @@ type Batch struct {
 	ID string
 	// MemberID 所属会员。
 	MemberID string
+	// Source 积分来源（如“开卡礼”“消费返积分”），自发放后不再改变。
+	Source string
 	// Granted 发放总量，自发放后永不改变。
 	Granted int64
 	// Remaining 当前仍可用于消费的数量（尚未消费、未撤销恢复、未过期）。
@@ -38,7 +40,8 @@ type Batch struct {
 	Expired int64
 	// ExpireAt 失效时刻：now 在该时刻之前批次可用，到达该时刻即失效。
 	ExpireAt time.Time
-	// CreatedAt 发放时刻（取自统一时钟）。
+	// CreatedAt 发放时刻（取自统一时钟）。CreatedAt 至 ExpireAt
+	// 即该批次积分的可用时间段。
 	CreatedAt time.Time
 	// ExpiredSwept 是否已经执行过过期推进；一旦为 true，
 	// 即使时钟被回拨，该批次也不会复活。
@@ -80,8 +83,11 @@ type ExpiredBatch struct {
 
 // GrantDetail 发放分录明细。
 type GrantDetail struct {
-	BatchID string
-	Amount  int64
+	// ExternalID 入账业务流水号（幂等键），未走幂等入账时为空。
+	ExternalID string
+	BatchID    string
+	Amount     int64
+	Source     string
 }
 
 // ConsumeDetail 消费分录明细。
@@ -104,6 +110,8 @@ type RevokeDetail struct {
 
 // ExpireDetail 过期分录明细。
 type ExpireDetail struct {
+	// ScanID 过期扫描业务流水号（幂等键），未走幂等扫描时为空。
+	ScanID  string
 	Batches []ExpiredBatch
 }
 
@@ -131,9 +139,11 @@ type Entry struct {
 
 // GrantReceipt 发放结果。
 type GrantReceipt struct {
-	EntryID string
-	BatchID string
-	Amount  int64
+	EntryID    string
+	BatchID    string
+	Amount     int64
+	ExternalID string
+	Source     string
 }
 
 // ConsumeReceipt 消费结果。重复提交相同内容时返回首次的分摊结果。
@@ -157,6 +167,8 @@ type RevokeReceipt struct {
 // ExpireReceipt 过期推进结果。没有批次过期时返回零值收据。
 type ExpireReceipt struct {
 	EntryID string
+	// ScanID 本次过期扫描的业务流水号，未走幂等扫描时为空。
+	ScanID  string
 	Batches []ExpiredBatch
 }
 
