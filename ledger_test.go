@@ -46,7 +46,7 @@ func newTestLedger(t *testing.T, c *fakeClock) *Ledger {
 
 func mustGrant(t *testing.T, l *Ledger, amount int64, expireAt time.Time) GrantReceipt {
 	t.Helper()
-	r, err := l.Grant(amount, expireAt, "")
+	r, err := l.Grant("", amount, expireAt, "", "")
 	if err != nil {
 		t.Fatalf("Grant(%d): %v", amount, err)
 	}
@@ -96,20 +96,20 @@ func TestGrantRejectsInvalidArguments(t *testing.T) {
 	c := newFakeClock(t0)
 	l := newTestLedger(t, c)
 
-	if _, err := l.Grant(0, t0.Add(time.Hour), ""); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := l.Grant("", 0, t0.Add(time.Hour), "", ""); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("grant 0: %v", err)
 	}
-	if _, err := l.Grant(-5, t0.Add(time.Hour), ""); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := l.Grant("", -5, t0.Add(time.Hour), "", ""); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("grant -5: %v", err)
 	}
-	if _, err := l.Grant(10, time.Time{}, ""); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := l.Grant("", 10, time.Time{}, "", ""); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("grant zero time: %v", err)
 	}
 	// 失效时间必须晚于当前时刻。
-	if _, err := l.Grant(10, t0, ""); !errors.Is(err, ErrAlreadyExpired) {
+	if _, err := l.Grant("", 10, t0, "", ""); !errors.Is(err, ErrAlreadyExpired) {
 		t.Fatalf("grant expiring now: %v", err)
 	}
-	if _, err := l.Grant(10, t0.Add(-time.Hour), ""); !errors.Is(err, ErrAlreadyExpired) {
+	if _, err := l.Grant("", 10, t0.Add(-time.Hour), "", ""); !errors.Is(err, ErrAlreadyExpired) {
 		t.Fatalf("grant expired: %v", err)
 	}
 	if _, err := New("", nil); !errors.Is(err, ErrInvalidArgument) {
@@ -207,7 +207,7 @@ func TestExpireAdvancesBatches(t *testing.T) {
 	staying := mustGrant(t, l, 20, t0.Add(48*time.Hour))
 
 	c.Advance(time.Hour) // 恰好到达失效时刻即视为过期
-	r, err := l.Expire()
+	r, err := l.Expire("")
 	if err != nil {
 		t.Fatalf("Expire: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestExpireAdvancesBatches(t *testing.T) {
 	}
 
 	// 幂等推进：再次 Expire 不再产生分录。
-	r2, err := l.Expire()
+	r2, err := l.Expire("")
 	if err != nil {
 		t.Fatalf("Expire again: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestRevokeAfterExpiryKeepsTraceButNotSpendable(t *testing.T) {
 
 	// b1 到期后被推进过期；其被消费的 40 仍占用 Consumed。
 	c.Advance(2 * time.Hour)
-	if _, err := l.Expire(); err != nil {
+	if _, err := l.Expire(""); err != nil {
 		t.Fatalf("Expire: %v", err)
 	}
 
@@ -430,7 +430,7 @@ func TestEntriesAndBatchQueries(t *testing.T) {
 	mustGrant(t, l, 100, t0.Add(24*time.Hour))
 	mustConsume(t, l, "c1", 30)
 	c.Advance(25 * time.Hour)
-	if _, err := l.Expire(); err != nil {
+	if _, err := l.Expire(""); err != nil {
 		t.Fatalf("Expire: %v", err)
 	}
 
@@ -533,7 +533,7 @@ func TestConcurrentConsumeExpireRevokeConsistent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		c.Advance(2 * time.Hour)
-		_, _ = l.Expire()
+		_, _ = l.Expire("")
 	}()
 	wg.Add(1)
 	go func() {
@@ -557,5 +557,224 @@ func TestConcurrentConsumeExpireRevokeConsistent(t *testing.T) {
 	}
 	if got := l.Available(); got < 0 {
 		t.Fatalf("negative balance: %d", got)
+	}
+}
+
+func TestGrantIdempotentReplay(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	first, err := l.Grant("grant-1", 100, t0.Add(24*time.Hour), "开卡礼", "")
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// 相同流水号、相同金额与来源：返回首次结果，不重复加分。
+	again, err := l.Grant("grant-1", 100, t0.Add(24*time.Hour), "开卡礼", "")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if again.EntryID != first.EntryID || again.BatchID != first.BatchID {
+		t.Fatalf("replay = %+v, want %+v", again, first)
+	}
+	if got := l.Available(); got != 100 {
+		t.Fatalf("available = %d, want 100", got)
+	}
+
+	// 时钟走过失效时间后重放，仍返回首次结果（幂等判定先于时间检查）。
+	c.Advance(48 * time.Hour)
+	late, err := l.Grant("grant-1", 100, t0.Add(24*time.Hour), "开卡礼", "")
+	if err != nil {
+		t.Fatalf("late replay: %v", err)
+	}
+	if late.BatchID != first.BatchID {
+		t.Fatalf("late replay batch = %s, want %s", late.BatchID, first.BatchID)
+	}
+	c.Set(t0)
+
+	// 同号但金额或来源变化：冲突，且不加分。
+	if _, err := l.Grant("grant-1", 101, t0.Add(24*time.Hour), "开卡礼", ""); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("amount conflict err = %v, want ErrDuplicateID", err)
+	}
+	if _, err := l.Grant("grant-1", 100, t0.Add(24*time.Hour), "消费返积分", ""); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("source conflict err = %v, want ErrDuplicateID", err)
+	}
+	if got := l.Available(); got != 100 {
+		t.Fatalf("available = %d, want 100", got)
+	}
+	// 批次记录来源。
+	if b := l.Batch(first.BatchID); b.Source != "开卡礼" {
+		t.Fatalf("batch source = %q, want 开卡礼", b.Source)
+	}
+}
+
+func TestExpireScanIdempotentReplay(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	b1 := mustGrant(t, l, 50, t0.Add(time.Hour))
+	b2 := mustGrant(t, l, 30, t0.Add(48*time.Hour))
+
+	c.Advance(time.Hour) // b1 到期
+	first, err := l.Expire("scan-1")
+	if err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+	if len(first.Batches) != 1 || first.Batches[0].BatchID != b1.BatchID || first.Batches[0].Amount != 50 {
+		t.Fatalf("first scan = %+v", first)
+	}
+
+	c.Advance(48 * time.Hour) // b2 也到期
+	// 同一扫描流水号迟到重放：返回首次结果，不吞掉新到期的 b2。
+	again, err := l.Expire("scan-1")
+	if err != nil {
+		t.Fatalf("replay scan: %v", err)
+	}
+	if again.EntryID != first.EntryID || len(again.Batches) != 1 || again.Batches[0].Amount != 50 {
+		t.Fatalf("replay scan = %+v, want original %+v", again, first)
+	}
+	if got := l.Available(); got != 0 {
+		t.Fatalf("available = %d, want 0 (b2 expired by clock)", got)
+	}
+	// b2 尚未被任何扫描核销，重复扫描不得替它产生分录。
+	if b := l.Batch(b2.BatchID); b.ExpiredSwept {
+		t.Fatalf("b2 swept by replayed scan: %+v", b)
+	}
+
+	// 新扫描流水号才核销 b2；再次扫描不再产生分录。
+	second, err := l.Expire("scan-2")
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if len(second.Batches) != 1 || second.Batches[0].BatchID != b2.BatchID || second.Batches[0].Amount != 30 {
+		t.Fatalf("second scan = %+v", second)
+	}
+	third, err := l.Expire("scan-3")
+	if err != nil {
+		t.Fatalf("third scan: %v", err)
+	}
+	if third.EntryID != "" || len(third.Batches) != 0 {
+		t.Fatalf("third scan should be a no-op: %+v", third)
+	}
+	// 过期只发生一次：b1 的 Expired 不会因多次扫描翻倍。
+	if b := l.Batch(b1.BatchID); b.Expired != 50 {
+		t.Fatalf("b1 expired = %d, want 50", b.Expired)
+	}
+}
+
+func TestPartiallyConsumedBatchExpiresOnlyRemainder(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	g := mustGrant(t, l, 100, t0.Add(time.Hour))
+	mustConsume(t, l, "c1", 30)
+
+	c.Advance(2 * time.Hour)
+	r, err := l.Expire("")
+	if err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+	// 只核销剩余未用的 70，已消费的 30 不计入过期。
+	if len(r.Batches) != 1 || r.Batches[0].Amount != 70 {
+		t.Fatalf("expire receipt = %+v, want 70", r.Batches)
+	}
+	b := l.Batch(g.BatchID)
+	if b.Remaining != 0 || b.Consumed != 30 || b.Expired != 70 {
+		t.Fatalf("batch = %+v, want remaining 0 / consumed 30 / expired 70", b)
+	}
+	if b.Granted != b.Remaining+b.Consumed+b.Expired {
+		t.Fatalf("batch invariant violated: %+v", b)
+	}
+}
+
+func TestConsumeExactlyAtExpireAtCannotUseBatch(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	mustGrant(t, l, 40, t0.Add(time.Hour))
+	mustGrant(t, l, 10, t0.Add(48*time.Hour))
+
+	c.Set(t0.Add(time.Hour)) // 恰好到达失效时刻
+	r := mustConsume(t, l, "c1", 10)
+	if len(r.Splits) != 1 || r.Splits[0].Amount != 10 {
+		t.Fatalf("splits = %+v", r.Splits)
+	}
+	if _, err := l.Consume("c2", 1, ""); !errors.Is(err, ErrInsufficientPoints) {
+		t.Fatalf("err = %v, want ErrInsufficientPoints", err)
+	}
+}
+
+func TestBalanceRecomputableFromEntries(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+
+	mustGrant(t, l, 100, t0.Add(time.Hour))
+	mustGrant(t, l, 60, t0.Add(72*time.Hour))
+	cons := mustConsume(t, l, "c1", 120) // 100 + 20
+	if _, err := l.Revoke(cons.ConsumeID, 50, "", ""); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	c.Advance(2 * time.Hour) // 第一批次到期
+	if _, err := l.Expire(""); err != nil {
+		t.Fatalf("Expire: %v", err)
+	}
+
+	// 由账本重算：发放 - 消费 + 撤销恢复 - 过期核销。
+	var recomputed int64
+	var grants, consumes, revokes, expires int
+	for _, e := range l.Entries() {
+		switch e.Type {
+		case EntryGrant:
+			recomputed += e.Amount
+			grants++
+		case EntryConsume:
+			recomputed -= e.Amount
+			consumes++
+		case EntryRevoke:
+			recomputed += e.Revoke.Restored
+			revokes++
+		case EntryExpire:
+			recomputed -= e.Amount
+			expires++
+		default:
+			t.Fatalf("unknown entry type %q", e.Type)
+		}
+	}
+	if grants != 2 || consumes != 1 || revokes != 1 || expires != 1 {
+		t.Fatalf("entries = %d/%d/%d/%d, want 2/1/1/1", grants, consumes, revokes, expires)
+	}
+	if got := l.Available(); recomputed != got {
+		t.Fatalf("recomputed = %d, available = %d", recomputed, got)
+	}
+}
+
+func TestConcurrentSameExternalIDConsumedOnce(t *testing.T) {
+	c := newFakeClock(t0)
+	l := newTestLedger(t, c)
+	mustGrant(t, l, 1000, t0.Add(24*time.Hour))
+
+	const workers = 32
+	var wg sync.WaitGroup
+	ids := make([]string, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			r, err := l.Consume("order-dup", 10, "")
+			if err != nil {
+				t.Errorf("consume: %v", err)
+				return
+			}
+			ids[w] = r.ConsumeID
+		}(w)
+	}
+	wg.Wait()
+
+	for w := 1; w < workers; w++ {
+		if ids[w] != ids[0] {
+			t.Fatalf("concurrent replay got different consume ids: %s vs %s", ids[w], ids[0])
+		}
+	}
+	if got := l.Available(); got != 990 {
+		t.Fatalf("available = %d, want 990 (single deduction)", got)
 	}
 }

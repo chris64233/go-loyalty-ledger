@@ -28,6 +28,8 @@ type Batch struct {
 	ID string
 	// MemberID 所属会员。
 	MemberID string
+	// Source 积分来源（如“开卡礼”“消费返积分”），自发放后不再改变。
+	Source string
 	// Granted 发放总量，自发放后永不改变。
 	Granted int64
 	// Remaining 当前仍可用于消费的数量（尚未消费、未撤销恢复、未过期）。
@@ -37,6 +39,7 @@ type Batch struct {
 	// Expired 已被过期推进核销的数量，永远不能重新变为可消费积分。
 	Expired int64
 	// ExpireAt 失效时刻：now 在该时刻之前批次可用，到达该时刻即失效。
+	// 批次的可用时间段为 [CreatedAt, ExpireAt)。
 	ExpireAt time.Time
 	// CreatedAt 发放时刻（取自统一时钟）。
 	CreatedAt time.Time
@@ -82,6 +85,10 @@ type ExpiredBatch struct {
 type GrantDetail struct {
 	BatchID string
 	Amount  int64
+	// ExternalID 业务流水号（幂等键），可能为空。
+	ExternalID string
+	// Source 积分来源。
+	Source string
 }
 
 // ConsumeDetail 消费分录明细。
@@ -191,4 +198,10 @@ func cloneExpiredBatches(in []ExpiredBatch) []ExpiredBatch {
 	out := make([]ExpiredBatch, len(in))
 	copy(out, in)
 	return out
+}
+
+// cloneExpireReceipt 返回过期推进收据的副本。
+func cloneExpireReceipt(r ExpireReceipt) ExpireReceipt {
+	r.Batches = cloneExpiredBatches(r.Batches)
+	return r
 }
